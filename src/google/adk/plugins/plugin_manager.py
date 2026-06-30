@@ -343,29 +343,33 @@ class PluginManager:
   ) -> None:
     """Executes a read-only observer callback for all registered plugins.
 
-    Unlike `_run_callbacks`, this never short-circuits: it invokes the callback
-    on every plugin in registration order and ignores all return values. It is
-    used for observability hooks that must not alter control flow.
+    Observer callbacks are pure side-effect hooks (e.g. observability) that must
+    not alter control flow. This differs from `_run_callbacks` in two ways:
+
+    - It never short-circuits: every plugin is invoked in registration order and
+      all return values are ignored.
+    - A plugin exception is logged and swallowed rather than re-raised, so a
+      buggy observability plugin cannot abort the operation it is only watching.
+      (An exception is the loudest possible alteration of control flow, which an
+      observer is contractually not allowed to do.)
 
     Args:
       callback_name: The name of the observer callback method to execute.
       **kwargs: Keyword arguments to be passed to the callback method.
-
-    Raises:
-      RuntimeError: If a plugin encounters an unhandled exception during
-        execution. The original exception is chained.
     """
     for plugin in self.plugins:
       callback_method = getattr(plugin, callback_name)
       try:
         await callback_method(**kwargs)
-      except Exception as e:
-        error_message = (
-            f"Error in plugin '{plugin.name}' during '{callback_name}'"
-            f" callback: {e}"
+      except Exception as e:  # pylint: disable=broad-except
+        logger.error(
+            "Error in plugin '%s' during '%s' observer callback; ignoring so it"
+            " does not affect the operation: %s",
+            plugin.name,
+            callback_name,
+            e,
+            exc_info=True,
         )
-        logger.error(error_message, exc_info=True)
-        raise RuntimeError(error_message) from e
 
   async def close(self) -> None:
     """Calls the close method on all registered plugins concurrently.

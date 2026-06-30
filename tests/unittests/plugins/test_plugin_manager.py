@@ -413,14 +413,24 @@ async def test_on_model_request_does_not_short_circuit(
 
 
 @pytest.mark.asyncio
-async def test_on_model_request_propagates_plugin_exception(
-    service: PluginManager, plugin1: TestPlugin
+async def test_on_model_request_swallows_plugin_exception(
+    service: PluginManager, plugin1: TestPlugin, plugin2: TestPlugin
 ):
-  """An exception in the observer hook is wrapped in a RuntimeError."""
+  """An exception in the observer hook is logged and swallowed, not raised.
+
+  A buggy observability plugin must not abort the model call, and later plugins
+  must still run.
+  """
   plugin1.exceptions_to_raise["on_model_request_callback"] = ValueError("boom")
   service.register_plugin(plugin1)
+  service.register_plugin(plugin2)
 
-  with pytest.raises(RuntimeError, match="on_model_request_callback"):
-    await service.run_on_model_request_callback(
-        callback_context=Mock(), llm_request=Mock()
-    )
+  # Does not raise.
+  result = await service.run_on_model_request_callback(
+      callback_context=Mock(), llm_request=Mock()
+  )
+
+  assert result is None
+  # The raising plugin was attempted, and the next plugin still ran.
+  assert "on_model_request_callback" in plugin1.call_log
+  assert "on_model_request_callback" in plugin2.call_log

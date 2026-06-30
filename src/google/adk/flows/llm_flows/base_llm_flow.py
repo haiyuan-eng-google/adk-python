@@ -610,6 +610,14 @@ class BaseLlmFlow(ABC):
             'Establishing live connection for agent: %s',
             invocation_context.agent.name,
         )
+        # Read-only observability hook: let plugins observe the exact
+        # LlmRequest that is about to be sent on the live/CFC path, immediately
+        # before llm.connect(). Runs for every plugin and cannot alter the call
+        # (see PluginManager.run_on_model_request_callback).
+        await invocation_context.plugin_manager.run_on_model_request_callback(
+            callback_context=CallbackContext(invocation_context),
+            llm_request=llm_request,
+        )
         async with llm.connect(llm_request) as llm_connection:
           # Reset retry count to allow the maximum reconnect attempts for
           # subsequent connection drops.
@@ -1356,17 +1364,6 @@ class BaseLlmFlow(ABC):
               invocation_context.agent.name
           )
 
-        # Read-only observability hook: let plugins observe the final
-        # LlmRequest, after all before_model_callbacks and label injection and
-        # immediately before it is sent. This runs for every plugin and cannot
-        # short-circuit the call (see PluginManager.run_on_model_request_callback).
-        await invocation_context.plugin_manager.run_on_model_request_callback(
-            callback_context=CallbackContext(
-                invocation_context, event_actions=model_response_event.actions
-            ),
-            llm_request=llm_request,
-        )
-
         # Calls the LLM.
         llm = self.__get_llm(invocation_context)
 
@@ -1407,6 +1404,18 @@ class BaseLlmFlow(ABC):
           # call pushes the counter beyond the max set value, then the
           # execution is stopped right here, and exception is thrown.
           invocation_context.increment_llm_call_count()
+
+          # Read-only observability hook: let plugins observe the final
+          # LlmRequest after the call-count guard and immediately before it is
+          # sent. Runs for every plugin and cannot alter the call (see
+          # PluginManager.run_on_model_request_callback).
+          await invocation_context.plugin_manager.run_on_model_request_callback(
+              callback_context=CallbackContext(
+                  invocation_context, event_actions=model_response_event.actions
+              ),
+              llm_request=llm_request,
+          )
+
           responses_generator = llm.generate_content_async(
               llm_request,
               stream=invocation_context.run_config.streaming_mode

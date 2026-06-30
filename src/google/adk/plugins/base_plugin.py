@@ -253,24 +253,28 @@ class BasePlugin(ABC):
   async def on_model_request_callback(
       self, *, callback_context: CallbackContext, llm_request: LlmRequest
   ) -> None:
-    """Read-only observation of the final `LlmRequest` before it is sent.
+    """Observes the final `LlmRequest` immediately before it is sent.
 
-    Unlike `before_model_callback`, this is a **read-only** observation point
-    that runs *after* all `before_model_callback`s (both plugin and agent) and
-    after ADK finalizes the request (e.g. `config.labels` injection). It
-    receives the exact `LlmRequest` object that is passed to the model, making
-    it the correct place for observability/auditing plugins to snapshot the
-    request that was actually sent.
+    This is the intended place for observability/auditing plugins to snapshot
+    the request that is actually sent to the model. Unlike `before_model_callback`,
+    it runs *after* all `before_model_callback`s (both plugin and agent) and
+    after ADK finalizes the request (e.g. `config.labels` injection), and it
+    receives the exact `LlmRequest` object passed to the model.
 
     Semantics:
 
-    - It is invoked for **every** registered plugin (there is no early exit);
-      the order follows plugin registration order and it is always the last
-      request-time hook to run.
-    - Its return value is ignored, and it **must not** mutate `llm_request` or
-      otherwise alter control flow. Use `before_model_callback` for mutation.
+    - It is invoked for **every** registered plugin (there is no early exit), in
+      plugin registration order, and it is always the last request-time hook to
+      run before the model call.
     - It does **not** fire when an earlier `before_model_callback` short-circuits
       the call by returning an `LlmResponse` (no request is sent in that case).
+    - Read-only by **convention**, not enforcement: for performance the live
+      `LlmRequest` is passed (no per-call copy). The return value is ignored, so
+      this hook cannot short-circuit the call, but if it mutates `llm_request`
+      the mutation **will** be sent to the model. Do not mutate here — use
+      `before_model_callback` for that.
+    - Exceptions raised here are logged and swallowed; they do not abort the
+      model call (an observer must not alter control flow).
 
     Args:
       callback_context: The context for the current agent call.
