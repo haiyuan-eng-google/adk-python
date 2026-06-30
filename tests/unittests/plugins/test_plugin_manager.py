@@ -85,6 +85,9 @@ class TestPlugin(BasePlugin):
   async def before_model_callback(self, **kwargs):
     return await self._handle_callback("before_model_callback")
 
+  async def on_model_request_callback(self, **kwargs):
+    return await self._handle_callback("on_model_request_callback")
+
   async def after_model_callback(self, **kwargs):
     return await self._handle_callback("after_model_callback")
 
@@ -363,3 +366,61 @@ async def test_set_skip_closing_plugins_false_reverts_to_closing(
   await service.close()
 
   plugin1.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_on_model_request_runs_all_plugins_in_order(
+    service: PluginManager, plugin1: TestPlugin, plugin2: TestPlugin
+):
+  """on_model_request is an observer hook: every plugin runs, in order."""
+  service.register_plugin(plugin1)
+  service.register_plugin(plugin2)
+
+  result = await service.run_on_model_request_callback(
+      callback_context=Mock(), llm_request=Mock()
+  )
+
+  # Observer hooks never produce a value.
+  assert result is None
+  assert "on_model_request_callback" in plugin1.call_log
+  assert "on_model_request_callback" in plugin2.call_log
+
+
+@pytest.mark.asyncio
+async def test_on_model_request_does_not_short_circuit(
+    service: PluginManager, plugin1: TestPlugin, plugin2: TestPlugin
+):
+  """A non-None return from a plugin must NOT stop later plugins or be returned.
+
+  This is the key difference from before_model_callback: the observer hook
+  cannot short-circuit the model call.
+  """
+  # Configure plugin1 to (incorrectly) return a value.
+  plugin1.return_values["on_model_request_callback"] = Mock(spec=LlmResponse)
+
+  service.register_plugin(plugin1)
+  service.register_plugin(plugin2)
+
+  result = await service.run_on_model_request_callback(
+      callback_context=Mock(), llm_request=Mock()
+  )
+
+  # The return value is ignored ...
+  assert result is None
+  # ... and the second plugin still runs despite plugin1 returning a value.
+  assert "on_model_request_callback" in plugin1.call_log
+  assert "on_model_request_callback" in plugin2.call_log
+
+
+@pytest.mark.asyncio
+async def test_on_model_request_propagates_plugin_exception(
+    service: PluginManager, plugin1: TestPlugin
+):
+  """An exception in the observer hook is wrapped in a RuntimeError."""
+  plugin1.exceptions_to_raise["on_model_request_callback"] = ValueError("boom")
+  service.register_plugin(plugin1)
+
+  with pytest.raises(RuntimeError, match="on_model_request_callback"):
+    await service.run_on_model_request_callback(
+        callback_context=Mock(), llm_request=Mock()
+    )

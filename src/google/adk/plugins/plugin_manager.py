@@ -49,6 +49,7 @@ PluginCallbackName = Literal[
     "before_tool_callback",
     "after_tool_callback",
     "before_model_callback",
+    "on_model_request_callback",
     "after_model_callback",
     "on_tool_error_callback",
     "on_model_error_callback",
@@ -245,6 +246,22 @@ class PluginManager:
         llm_request=llm_request,
     )
 
+  async def run_on_model_request_callback(
+      self, *, callback_context: CallbackContext, llm_request: LlmRequest
+  ) -> None:
+    """Runs the read-only `on_model_request_callback` for all plugins.
+
+    Unlike the other `run_*` callbacks, this is an observer hook: it never
+    short-circuits, invokes the callback on every registered plugin, and ignores
+    all return values. Plugins use it to observe the final `LlmRequest` right
+    before it is sent to the model.
+    """
+    await self._run_observer_callbacks(
+        "on_model_request_callback",
+        callback_context=callback_context,
+        llm_request=llm_request,
+    )
+
   async def run_after_model_callback(
       self, *, callback_context: CallbackContext, llm_response: LlmResponse
   ) -> Optional[LlmResponse]:
@@ -320,6 +337,35 @@ class PluginManager:
         raise RuntimeError(error_message) from e
 
     return None
+
+  async def _run_observer_callbacks(
+      self, callback_name: PluginCallbackName, **kwargs: Any
+  ) -> None:
+    """Executes a read-only observer callback for all registered plugins.
+
+    Unlike `_run_callbacks`, this never short-circuits: it invokes the callback
+    on every plugin in registration order and ignores all return values. It is
+    used for observability hooks that must not alter control flow.
+
+    Args:
+      callback_name: The name of the observer callback method to execute.
+      **kwargs: Keyword arguments to be passed to the callback method.
+
+    Raises:
+      RuntimeError: If a plugin encounters an unhandled exception during
+        execution. The original exception is chained.
+    """
+    for plugin in self.plugins:
+      callback_method = getattr(plugin, callback_name)
+      try:
+        await callback_method(**kwargs)
+      except Exception as e:
+        error_message = (
+            f"Error in plugin '{plugin.name}' during '{callback_name}'"
+            f" callback: {e}"
+        )
+        logger.error(error_message, exc_info=True)
+        raise RuntimeError(error_message) from e
 
   async def close(self) -> None:
     """Calls the close method on all registered plugins concurrently.

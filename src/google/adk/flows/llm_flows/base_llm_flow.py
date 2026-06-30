@@ -1356,6 +1356,17 @@ class BaseLlmFlow(ABC):
               invocation_context.agent.name
           )
 
+        # Read-only observability hook: let plugins observe the final
+        # LlmRequest, after all before_model_callbacks and label injection and
+        # immediately before it is sent. This runs for every plugin and cannot
+        # short-circuit the call (see PluginManager.run_on_model_request_callback).
+        await invocation_context.plugin_manager.run_on_model_request_callback(
+            callback_context=CallbackContext(
+                invocation_context, event_actions=model_response_event.actions
+            ),
+            llm_request=llm_request,
+        )
+
         # Calls the LLM.
         llm = self.__get_llm(invocation_context)
 

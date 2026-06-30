@@ -16,6 +16,7 @@ from typing import Optional
 
 from google.adk.agents.callback_context import CallbackContext
 from google.adk.agents.llm_agent import Agent
+from google.adk.flows.llm_flows.base_llm_flow import _ADK_AGENT_NAME_LABEL_KEY
 from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
 from google.adk.plugins.base_plugin import BasePlugin
@@ -47,6 +48,10 @@ class MockPlugin(BasePlugin):
     self.enable_before_model_callback = False
     self.enable_after_model_callback = False
     self.enable_on_model_error_callback = False
+    # Records the request observed by on_model_request_callback.
+    self.on_model_request_count = 0
+    self.observed_labels: dict[str, str] = {}
+    self.observed_texts: list[str] = []
     self.before_model_response = LlmResponse(
         content=testing_utils.ModelContent(
             [types.Part.from_text(text=self.before_model_text)]
@@ -69,6 +74,19 @@ class MockPlugin(BasePlugin):
     if not self.enable_before_model_callback:
       return None
     return self.before_model_response
+
+  async def on_model_request_callback(
+      self, *, callback_context: CallbackContext, llm_request: LlmRequest
+  ) -> None:
+    # Read-only observation of the finalized request.
+    self.on_model_request_count += 1
+    self.observed_labels = dict((llm_request.config and llm_request.config.labels) or {})
+    self.observed_texts = [
+        part.text
+        for content in (llm_request.contents or [])
+        for part in (content.parts or [])
+        if part.text
+    ]
 
   async def after_model_callback(
       self, *, callback_context: CallbackContext, llm_response: LlmResponse
@@ -183,6 +201,68 @@ def test_on_model_error_callback_fallback_to_runner(mock_plugin):
     testing_utils.InMemoryRunner(agent, plugins=[mock_plugin])
   except Exception as e:
     assert e == mock_error
+
+
+AGENT_MUTATION_TEXT = 'mutation_from_agent_before_model_callback'
+
+
+def mutating_before_model_callback(
+    *, callback_context: CallbackContext, llm_request: LlmRequest
+) -> Optional[LlmResponse]:
+  """Agent before_model_callback that mutates the request, then proceeds."""
+  llm_request.contents.append(
+      types.Content(
+          role='user',
+          parts=[types.Part.from_text(text=AGENT_MUTATION_TEXT)],
+      )
+  )
+  return None
+
+
+def test_on_model_request_observes_finalized_request(mock_plugin):
+  """on_model_request sees the request after the agent callback AND the
+
+  ADK-injected agent-name label, i.e. exactly what is sent to the model.
+  """
+  mock_model = testing_utils.MockModel.create(responses=['model_response'])
+  agent = Agent(
+      name='root_agent',
+      model=mock_model,
+      before_model_callback=mutating_before_model_callback,
+  )
+
+  runner = testing_utils.InMemoryRunner(agent, plugins=[mock_plugin])
+  assert testing_utils.simplify_events(runner.run('test')) == [
+      ('root_agent', 'model_response'),
+  ]
+
+  # The hook fired exactly once for the single model call.
+  assert mock_plugin.on_model_request_count == 1
+  # It observed the mutation made by the agent's before_model_callback, which
+  # runs AFTER the plugin before_model_callback.
+  assert AGENT_MUTATION_TEXT in mock_plugin.observed_texts
+  # It observed the agent-name label, which ADK injects AFTER all callbacks.
+  assert mock_plugin.observed_labels.get(_ADK_AGENT_NAME_LABEL_KEY) == 'root_agent'
+
+
+def test_on_model_request_skipped_when_before_model_short_circuits(mock_plugin):
+  """When before_model_callback short-circuits, no request is sent, so the
+
+  observer hook must NOT fire.
+  """
+  mock_plugin.enable_before_model_callback = True
+  mock_model = testing_utils.MockModel.create(responses=['model_response'])
+  agent = Agent(
+      name='root_agent',
+      model=mock_model,
+  )
+
+  runner = testing_utils.InMemoryRunner(agent, plugins=[mock_plugin])
+  assert testing_utils.simplify_events(runner.run('test')) == [
+      ('root_agent', mock_plugin.before_model_text),
+  ]
+
+  assert mock_plugin.on_model_request_count == 0
 
 
 if __name__ == '__main__':
