@@ -614,6 +614,18 @@ class BaseLlmFlow(ABC):
         # LlmRequest that is about to be sent on the live/CFC path, immediately
         # before llm.connect(). Runs for every plugin and cannot alter the call
         # (see PluginManager.run_on_model_request_callback).
+        #
+        # This sits inside the reconnect `while` loop, so it fires once per
+        # connect() attempt: a dropped-and-resumed live session re-fires the
+        # observer for each reconnect. That is intentional — every connect() is
+        # a real send of `llm_request`.
+        #
+        # Unlike the normal path, this request is the fresh object built by
+        # run_live: it is not routed through before_model_callback and is not
+        # given the adk_agent_name label (the documented weaker live/CFC
+        # contract, see on_model_request_callback). The bare CallbackContext
+        # (no event_actions) is deliberate — there is no model_response_event on
+        # this path and a read-only observer must not depend on event_actions.
         await invocation_context.plugin_manager.run_on_model_request_callback(
             callback_context=CallbackContext(invocation_context),
             llm_request=llm_request,

@@ -19,10 +19,14 @@ from google.adk.agents.invocation_context import LlmCallsLimitExceededError
 from google.adk.agents.live_request_queue import LiveRequestQueue
 from google.adk.agents.llm_agent import Agent
 from google.adk.agents.run_config import RunConfig
+from google.adk.agents.run_config import StreamingMode
+from google.adk.events.event import Event
 from google.adk.flows.llm_flows.base_llm_flow import _ADK_AGENT_NAME_LABEL_KEY
+from google.adk.flows.llm_flows.base_llm_flow import BaseLlmFlow
 from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
 from google.adk.plugins.base_plugin import BasePlugin
+from google.adk.utils.context_utils import Aclosing
 from google.genai import types
 from google.genai.errors import ClientError
 import pytest
@@ -90,8 +94,8 @@ class MockPlugin(BasePlugin):
     )
     self.observed_texts = [
         part.text
-        for content in (llm_request.contents or [])
-        for part in (content.parts or [])
+        for content in llm_request.contents or []
+        for part in content.parts or []
         if part.text
     ]
 
@@ -280,10 +284,75 @@ def test_on_model_request_observes_request_sent_on_live_path(mock_plugin):
   )
   runner.run_live(live_request_queue)
 
-  assert mock_plugin.on_model_request_count >= 1
+  # Single connection, no reconnect: the hook fires exactly once. (It sits in
+  # run_live's reconnect loop, so a resumed session would re-fire per connect().)
+  assert mock_plugin.on_model_request_count == 1
   # run_live builds a fresh LlmRequest and passes it to llm.connect(); the
   # observer must see that exact object, not the outer _call_llm_async request.
   assert mock_plugin.observed_request_ids[-1] == id(mock_model.requests[-1])
+  # Narrowed live/CFC contract: run_live's request is not finalized, so it
+  # carries no adk_agent_name label (unlike the normal path). See issue #6222.
+  assert _ADK_AGENT_NAME_LABEL_KEY not in mock_plugin.observed_labels
+
+
+@pytest.mark.asyncio
+async def test_on_model_request_live_cfc_is_not_finalized(mock_plugin):
+  """CFC path: the observer sees run_live's fresh, un-finalized request.
+
+  With support_cfc=True, `_call_llm_async` runs before_model_callback and injects
+  the adk_agent_name label on the OUTER request, then `run_live()` builds a fresh
+  LlmRequest and sends that. Per the documented contract the observer sees the
+  fresh object (no adk_agent_name), which diverges from the finalized outer
+  request. This pins the narrowed live/CFC contract (issue #6222); making the
+  live path finalize would be a deliberate, test-visible change.
+  """
+  live_response = LlmResponse(
+      content=testing_utils.ModelContent(
+          [types.Part.from_text(text='live_cfc_response')]
+      ),
+      turn_complete=True,
+  )
+  mock_model = testing_utils.MockModel.create(responses=[live_response])
+  agent = Agent(name='root_agent', model=mock_model)
+
+  invocation_context = await testing_utils.create_invocation_context(
+      agent=agent,
+      user_content='test',
+      run_config=RunConfig(support_cfc=True, streaming_mode=StreamingMode.SSE),
+      plugins=[mock_plugin],
+  )
+  model_response_event = Event(
+      id=Event.new_id(),
+      invocation_id=invocation_context.invocation_id,
+      author='root_agent',
+  )
+
+  outer_request = LlmRequest(model='mock')
+  flow = BaseLlmFlow()
+  responses = []
+  async with Aclosing(
+      flow._call_llm_async(
+          invocation_context, outer_request, model_response_event
+      )
+  ) as agen:
+    async for resp in agen:
+      responses.append(resp)
+      # The first live response is enough; the observer has already fired before
+      # connect(). Breaking avoids waiting on run_live's empty send queue;
+      # Aclosing() finalizes run_live (cancelling its send task).
+      break
+
+  assert len(responses) >= 1
+  # The hook fired once for the single live connection.
+  assert mock_plugin.on_model_request_count == 1
+  # It observed the exact fresh object passed to llm.connect().
+  assert mock_plugin.observed_request_ids[-1] == id(mock_model.requests[-1])
+  # The OUTER request WAS finalized with the label...
+  assert (
+      outer_request.config.labels.get(_ADK_AGENT_NAME_LABEL_KEY) == 'root_agent'
+  )
+  # ...but the observed (live) request was NOT — the divergence #6222 flags.
+  assert _ADK_AGENT_NAME_LABEL_KEY not in mock_plugin.observed_labels
 
 
 @pytest.mark.asyncio

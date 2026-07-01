@@ -40,6 +40,8 @@ class FullOverridePlugin(BasePlugin):
 
   """A plugin that overrides every single callback method for testing."""
 
+  on_model_request_called = False
+
   def __init__(self, name: str = "full_override"):
     super().__init__(name)
 
@@ -72,6 +74,12 @@ class FullOverridePlugin(BasePlugin):
 
   async def before_model_callback(self, **kwargs) -> str:
     return "overridden_before_model"
+
+  async def on_model_request_callback(self, **kwargs) -> None:
+    # Observer contract returns None; record the call so the override is
+    # verifiable in the surface test.
+    self.on_model_request_called = True
+    return None
 
   async def after_model_callback(self, **kwargs) -> str:
     return "overridden_after_model"
@@ -159,6 +167,12 @@ async def test_base_plugin_default_callbacks_return_none():
       is None
   )
   assert (
+      await plugin.on_model_request_callback(
+          callback_context=mock_context, llm_request=mock_context
+      )
+      is None
+  )
+  assert (
       await plugin.after_model_callback(
           callback_context=mock_context, llm_response=mock_context
       )
@@ -240,6 +254,13 @@ async def test_base_plugin_all_callbacks_can_be_overridden():
       )
       == "overridden_before_model"
   )
+  assert (
+      await plugin.on_model_request_callback(
+          callback_context=mock_callback_context, llm_request=mock_llm_request
+      )
+      is None
+  )
+  assert plugin.on_model_request_called is True
   assert (
       await plugin.after_model_callback(
           callback_context=mock_callback_context, llm_response=mock_llm_response
