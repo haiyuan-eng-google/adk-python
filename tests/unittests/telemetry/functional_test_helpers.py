@@ -339,6 +339,11 @@ _PATCHED_HISTOGRAMS: tuple[HistogramSpec, ...] = (
         attr="_client_token_usage",
         metric_name="gen_ai.client.token.usage",
     ),
+    HistogramSpec(
+        module=_metrics,
+        attr="_workflow_invocation_duration",
+        metric_name="gen_ai.invoke_workflow.duration",
+    ),
 )
 
 
