@@ -330,7 +330,8 @@ def _extract_tool_declarations(
   """
   tools: list[dict[str, Any]] = []
   for name, tool in tools_dict.items():
-    entry: dict[str, Any] = {"name": getattr(tool, "name", name)}
+    # Fall back to the dict key when the tool has no (or a falsy) name.
+    entry: dict[str, Any] = {"name": getattr(tool, "name", None) or name}
     description = getattr(tool, "description", None)
     if description:
       entry["description"] = description
@@ -338,17 +339,24 @@ def _extract_tool_declarations(
     # The parameter schema lives on the tool's FunctionDeclaration, which some
     # tools (e.g. built-in tools) do not provide. Resolve defensively so a
     # single failing tool does not discard the whole tools list.
+    #
+    # Note: FunctionTool._get_declaration() rebuilds the declaration from the
+    # function signature on each call (no caching), so this repeats work the
+    # framework already did when assembling the request. Acceptable for typical
+    # toolsets; revisit with a cache if it shows up on the hot path.
     declaration = None
     try:
       get_declaration = getattr(tool, "_get_declaration", None)
       if callable(get_declaration):
         declaration = get_declaration()
     except Exception:  # pylint: disable=broad-except
-      declaration = None
+      logger.debug("Failed to get declaration for tool %s", name, exc_info=True)
 
     if declaration is not None:
-      if "description" not in entry and getattr(declaration, "description", None):
-        entry["description"] = declaration.description
+      if "description" not in entry:
+        decl_description = getattr(declaration, "description", None)
+        if decl_description:
+          entry["description"] = decl_description
       parameters = getattr(declaration, "parameters", None)
       if parameters is not None:
         try:
@@ -357,7 +365,11 @@ def _extract_tool_declarations(
           )
         except Exception:  # pylint: disable=broad-except
           # Leave parameters off if the schema is not JSON-serializable.
-          pass
+          logger.debug(
+              "Failed to serialize parameters for tool %s",
+              name,
+              exc_info=True,
+          )
 
     tools.append(entry)
   return tools
@@ -4085,7 +4097,8 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
     """
 
     # 5. Attributes (Config & Tools)
-    attributes = {}
+    attributes: dict[str, Any] = {}
+    tools_truncated = False
     if llm_request.config:
       config_dict = {}
       for field_name in [
@@ -4114,13 +4127,21 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
         attributes["labels"] = labels
 
     if hasattr(llm_request, "tools_dict") and llm_request.tools_dict:
-      attributes["tools"] = _extract_tool_declarations(llm_request.tools_dict)
+      # Route tool declarations through the shared safety pipeline so unbounded
+      # descriptions / parameter schemas are size-capped and sensitive keys are
+      # redacted, consistent with every other captured attribute.
+      tools, tools_truncated = _recursive_smart_truncate(
+          _extract_tool_declarations(llm_request.tools_dict),
+          self.config.max_content_length,
+      )
+      attributes["tools"] = tools
 
     TraceManager.push_span(callback_context, "llm_request")
     await self._log_event(
         "LLM_REQUEST",
         callback_context,
         raw_content=llm_request,
+        is_truncated=tools_truncated,
         event_data=EventData(
             model=llm_request.model,
             extra_attributes=attributes,
