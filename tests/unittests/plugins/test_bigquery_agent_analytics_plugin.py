@@ -1451,7 +1451,85 @@ class TestBigQueryAgentAnalyticsPlugin:
     assert attributes["llm_config"]["temperature"] == 0.5
     assert attributes["llm_config"]["top_p"] == 0.9
     assert attributes["llm_config"]["top_p"] == 0.9
-    assert attributes["tools"] == ["tool1", "tool2"]
+    # Tools without a name/description/declaration fall back to just the key.
+    assert attributes["tools"] == [{"name": "tool1"}, {"name": "tool2"}]
+
+  @pytest.mark.asyncio
+  async def test_before_model_callback_logs_tool_declarations(
+      self,
+      bq_plugin_inst,
+      mock_write_client,
+      callback_context,
+      dummy_arrow_schema,
+  ):
+    """LLM_REQUEST tools carry name, description, and parameter schema."""
+
+    class _FakeTool(base_tool_lib.BaseTool):
+
+      def __init__(self, name, description, declaration):
+        super().__init__(name=name, description=description)
+        self._declaration = declaration
+
+      def _get_declaration(self):
+        return self._declaration
+
+    execute_sql = _FakeTool(
+        name="execute_sql",
+        description="Run a SQL query against BigQuery.",
+        declaration=types.FunctionDeclaration(
+            name="execute_sql",
+            description="Run a SQL query against BigQuery.",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "query": types.Schema(
+                        type=types.Type.STRING,
+                        description="The SQL query to run.",
+                    )
+                },
+                required=["query"],
+            ),
+        ),
+    )
+    # A tool without a declaration still contributes name + description.
+    list_datasets = _FakeTool(
+        name="list_dataset_ids",
+        description="List available datasets.",
+        declaration=None,
+    )
+
+    llm_request = llm_request_lib.LlmRequest(
+        model="gemini-pro",
+        contents=[types.Content(role="user", parts=[types.Part(text="hi")])],
+    )
+    llm_request.tools_dict = {
+        "execute_sql": execute_sql,
+        "list_dataset_ids": list_datasets,
+    }
+    bigquery_agent_analytics_plugin.TraceManager.push_span(callback_context)
+    await bq_plugin_inst.before_model_callback(
+        callback_context=callback_context, llm_request=llm_request
+    )
+    await asyncio.sleep(0.01)
+    log_entry = await _get_captured_event_dict_async(
+        mock_write_client, dummy_arrow_schema
+    )
+    _assert_common_fields(log_entry, "LLM_REQUEST")
+    attributes = json.loads(log_entry["attributes"])
+    tools_by_name = {t["name"]: t for t in attributes["tools"]}
+
+    assert tools_by_name["execute_sql"]["description"] == (
+        "Run a SQL query against BigQuery."
+    )
+    params = tools_by_name["execute_sql"]["parameters"]
+    assert params["type"] == "OBJECT"
+    assert params["properties"]["query"]["type"] == "STRING"
+    assert params["required"] == ["query"]
+
+    assert tools_by_name["list_dataset_ids"]["description"] == (
+        "List available datasets."
+    )
+    assert "parameters" not in tools_by_name["list_dataset_ids"]
 
   @pytest.mark.asyncio
   async def test_before_model_callback_with_full_config(

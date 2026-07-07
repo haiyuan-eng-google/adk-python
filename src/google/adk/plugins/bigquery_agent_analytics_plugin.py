@@ -306,6 +306,63 @@ def _get_tool_origin(
   return "UNKNOWN"
 
 
+def _extract_tool_declarations(
+    tools_dict: dict[str, "BaseTool"],
+) -> list[dict[str, Any]]:
+  """Extracts structured tool metadata for the ``LLM_REQUEST`` event.
+
+  Earlier versions logged only the tool names (``list(tools_dict.keys())``).
+  Downstream consumers such as online evaluation need the tool *description* and
+  *parameter schema* to judge whether the model selected and invoked the right
+  tool, so this returns one structured entry per tool instead of a bare name.
+
+  Each entry always carries ``name`` and, when available, ``description`` and
+  ``parameters`` (the OpenAPI parameter schema from the tool's
+  ``FunctionDeclaration``). Extraction is best-effort and per-tool: a tool whose
+  declaration cannot be resolved still contributes its name and description, so
+  one misbehaving tool never drops the whole ``tools`` attribute.
+
+  Args:
+      tools_dict: Mapping of tool name to ``BaseTool`` from ``LlmRequest``.
+
+  Returns:
+      A list of ``{"name", "description"?, "parameters"?}`` dicts.
+  """
+  tools: list[dict[str, Any]] = []
+  for name, tool in tools_dict.items():
+    entry: dict[str, Any] = {"name": getattr(tool, "name", name)}
+    description = getattr(tool, "description", None)
+    if description:
+      entry["description"] = description
+
+    # The parameter schema lives on the tool's FunctionDeclaration, which some
+    # tools (e.g. built-in tools) do not provide. Resolve defensively so a
+    # single failing tool does not discard the whole tools list.
+    declaration = None
+    try:
+      get_declaration = getattr(tool, "_get_declaration", None)
+      if callable(get_declaration):
+        declaration = get_declaration()
+    except Exception:  # pylint: disable=broad-except
+      declaration = None
+
+    if declaration is not None:
+      if "description" not in entry and getattr(declaration, "description", None):
+        entry["description"] = declaration.description
+      parameters = getattr(declaration, "parameters", None)
+      if parameters is not None:
+        try:
+          entry["parameters"] = parameters.model_dump(
+              exclude_none=True, mode="json"
+          )
+        except Exception:  # pylint: disable=broad-except
+          # Leave parameters off if the schema is not JSON-serializable.
+          pass
+
+    tools.append(entry)
+  return tools
+
+
 _SENSITIVE_KEYS = frozenset({
     "client_secret",
     "access_token",
@@ -4057,7 +4114,7 @@ class BigQueryAgentAnalyticsPlugin(BasePlugin):
         attributes["labels"] = labels
 
     if hasattr(llm_request, "tools_dict") and llm_request.tools_dict:
-      attributes["tools"] = list(llm_request.tools_dict.keys())
+      attributes["tools"] = _extract_tool_declarations(llm_request.tools_dict)
 
     TraceManager.push_span(callback_context, "llm_request")
     await self._log_event(
