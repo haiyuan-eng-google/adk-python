@@ -357,19 +357,28 @@ def _extract_tool_declarations(
         decl_description = getattr(declaration, "description", None)
         if decl_description:
           entry["description"] = decl_description
-      parameters = getattr(declaration, "parameters", None)
-      if parameters is not None:
-        try:
-          entry["parameters"] = parameters.model_dump(
-              exclude_none=True, mode="json"
-          )
-        except Exception:  # pylint: disable=broad-except
-          # Leave parameters off if the schema is not JSON-serializable.
-          logger.debug(
-              "Failed to serialize parameters for tool %s",
-              name,
-              exc_info=True,
-          )
+      # A declaration carries its parameter schema in one of two shapes: the
+      # structured `parameters` Schema, or a raw JSON-schema dict in
+      # `parameters_json_schema`. Several tools (MCP, OpenAPI, skill, node, and
+      # environment tools) populate only the latter, and model adapters prefer
+      # it, so prefer it here too and fall back to `parameters` otherwise.
+      json_schema = getattr(declaration, "parameters_json_schema", None)
+      if json_schema is not None:
+        entry["parameters"] = json_schema
+      else:
+        parameters = getattr(declaration, "parameters", None)
+        if parameters is not None:
+          try:
+            entry["parameters"] = parameters.model_dump(
+                exclude_none=True, mode="json"
+            )
+          except Exception:  # pylint: disable=broad-except
+            # Leave parameters off if the schema is not JSON-serializable.
+            logger.debug(
+                "Failed to serialize parameters for tool %s",
+                name,
+                exc_info=True,
+            )
 
     tools.append(entry)
   return tools

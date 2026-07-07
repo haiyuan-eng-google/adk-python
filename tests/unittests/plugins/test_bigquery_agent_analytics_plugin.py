@@ -1578,6 +1578,35 @@ class TestBigQueryAgentAnalyticsPlugin:
     # Name + description survive; the unserializable parameters key is omitted.
     assert result == [{"name": "bad_params", "description": "Bad."}]
 
+  def test_extract_tool_declarations_uses_parameters_json_schema(self):
+    """Declarations exposing parameters_json_schema log that raw schema."""
+
+    json_schema = {
+        "type": "object",
+        "properties": {"path": {"type": "string"}},
+        "required": ["path"],
+    }
+
+    class _JsonSchemaTool(base_tool_lib.BaseTool):
+
+      def _get_declaration(self):
+        return types.FunctionDeclaration(
+            name="read_file",
+            description="Read a file.",
+            parameters_json_schema=json_schema,
+        )
+
+    result = bigquery_agent_analytics_plugin._extract_tool_declarations(
+        {"read_file": _JsonSchemaTool(name="read_file", description="Read.")}
+    )
+
+    # parameters_json_schema is logged verbatim (preferred over `parameters`).
+    assert result == [{
+        "name": "read_file",
+        "description": "Read.",
+        "parameters": json_schema,
+    }]
+
   @pytest.mark.asyncio
   async def test_before_model_callback_with_full_config(
       self,
