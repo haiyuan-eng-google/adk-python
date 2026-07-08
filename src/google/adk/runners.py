@@ -498,27 +498,38 @@ class Runner:
         # Fresh: use user message as node_input
         node_input = new_message
 
-      # Run callbacks on user message
-      if new_message:
-        modified_user_message = (
-            await ic.plugin_manager.run_on_user_message_callback(
-                invocation_context=ic, user_message=new_message
-            )
-        )
-        if modified_user_message is not None:
-          new_message = modified_user_message
-          ic.user_content = new_message
+      # Failures in the setup hooks below (on_user_message_callback, the
+      # user-event session append, and before_run_callback) must also notify
+      # on_run_error_callback: they are part of runner execution even though
+      # they run before the main event loop. Notification-only; the original
+      # exception is always re-raised, and after_run stays success-only.
+      try:
+        # Run callbacks on user message
+        if new_message:
+          modified_user_message = (
+              await ic.plugin_manager.run_on_user_message_callback(
+                  invocation_context=ic, user_message=new_message
+              )
+          )
+          if modified_user_message is not None:
+            new_message = modified_user_message
+            ic.user_content = new_message
 
-      # Append user message to session for history
-      if new_message:
-        user_event = await self._append_user_event(
-            ic, new_message, state_delta=state_delta
-        )
-        if yield_user_message and user_event:
-          yield user_event
+        # Append user message to session for history
+        if new_message:
+          user_event = await self._append_user_event(
+              ic, new_message, state_delta=state_delta
+          )
+          if yield_user_message and user_event:
+            yield user_event
 
-      # Run before_run callbacks
-      await ic.plugin_manager.run_before_run_callback(invocation_context=ic)
+        # Run before_run callbacks
+        await ic.plugin_manager.run_before_run_callback(invocation_context=ic)
+      except Exception as e:
+        await ic.plugin_manager.run_on_run_error_callback(
+            invocation_context=ic, error=e
+        )
+        raise
 
       # 3. Start root node in background
       from .agents.base_agent import BaseAgent
@@ -571,31 +582,48 @@ class Runner:
       task = asyncio.create_task(_drive_root_node())
 
       # 4. Main loop: consume events, persist, yield
+      run_error = None
       try:
-        async with aclosing(
-            self._consume_event_queue(ic, done_sentinel)
-        ) as agen:
-          async for event in agen:
-            yield event
-      finally:
-        await self._cleanup_root_task(task, self.agent.name)
-        await ic.plugin_manager.run_after_run_callback(invocation_context=ic)
-        if self.app and self.app.events_compaction_config:
-          logger.debug('Running event compactor.')
-          from google.adk.apps.compaction import _run_compaction_for_sliding_window
-
+        try:
           async with aclosing(
-              _run_compaction_for_sliding_window(
-                  self.app,
-                  session,
-                  self.session_service,
-                  skip_token_compaction=ic.token_compaction_checked,
-              )
-          ) as compaction_events:
-            async for compaction_event in compaction_events:
-              await self.session_service.append_event(
-                  session=session, event=compaction_event
-              )
+              self._consume_event_queue(ic, done_sentinel)
+          ) as agen:
+            async for event in agen:
+              yield event
+        finally:
+          # _cleanup_root_task re-raises a root-node Exception (if any) after
+          # the event stream has drained.
+          await self._cleanup_root_task(task, self.agent.name)
+      except Exception as e:
+        # An unhandled exception escaped runner execution. Notify plugins
+        # (notification-only) and re-raise. after_run stays success-only.
+        run_error = e
+        await ic.plugin_manager.run_on_run_error_callback(
+            invocation_context=ic, error=e
+        )
+        raise
+      finally:
+        # Success path (also caller early-stop via GeneratorExit, which is not
+        # an Exception): run after_run and compaction. _cleanup_root_task has
+        # already run in the inner finally above.
+        if run_error is None:
+          await ic.plugin_manager.run_after_run_callback(invocation_context=ic)
+          if self.app and self.app.events_compaction_config:
+            logger.debug('Running event compactor.')
+            from google.adk.apps.compaction import _run_compaction_for_sliding_window
+
+            async with aclosing(
+                _run_compaction_for_sliding_window(
+                    self.app,
+                    session,
+                    self.session_service,
+                    skip_token_compaction=ic.token_compaction_checked,
+                )
+            ) as compaction_events:
+              async for compaction_event in compaction_events:
+                await self.session_service.append_event(
+                    session=session, event=compaction_event
+                )
 
   async def _run_node_live(
       self,
@@ -646,11 +674,22 @@ class Runner:
     task = asyncio.create_task(_drive_root_node())
 
     try:
-      async with aclosing(self._consume_event_queue(ic, done_sentinel)) as agen:
-        async for event in agen:
-          yield event
-    finally:
-      await self._cleanup_root_task(task, self.agent.name)
+      try:
+        async with aclosing(
+            self._consume_event_queue(ic, done_sentinel)
+        ) as agen:
+          async for event in agen:
+            yield event
+      finally:
+        # _cleanup_root_task re-raises a root-node Exception (if any).
+        await self._cleanup_root_task(task, self.agent.name)
+    except Exception as e:
+      # An unhandled exception escaped live runner execution. Notify plugins
+      # (notification-only) and re-raise.
+      await ic.plugin_manager.run_on_run_error_callback(
+          invocation_context=ic, error=e
+      )
+      raise
 
   def _extract_resume_inputs(
       self, message: Optional[types.Content]
@@ -1373,63 +1412,73 @@ class Runner:
 
     plugin_manager = invocation_context.plugin_manager
 
-    # Step 1: Run the before_run callbacks to see if we should early exit.
-    early_exit_result = await plugin_manager.run_before_run_callback(
-        invocation_context=invocation_context
-    )
-    if isinstance(early_exit_result, types.Content):
-      early_exit_event = Event(
-          invocation_id=invocation_context.invocation_id,
-          author='model',
-          content=early_exit_result,
+    try:
+      # Step 1: Run the before_run callbacks to see if we should early exit.
+      early_exit_result = await plugin_manager.run_before_run_callback(
+          invocation_context=invocation_context
       )
-      _apply_run_config_custom_metadata(
-          early_exit_event, invocation_context.run_config
-      )
-      if self._should_append_event(early_exit_event, is_live_call):
-        await self.session_service.append_event(
-            session=invocation_context.session,
-            event=early_exit_event,
+      if isinstance(early_exit_result, types.Content):
+        early_exit_event = Event(
+            invocation_id=invocation_context.invocation_id,
+            author='model',
+            content=early_exit_result,
         )
-      yield early_exit_event
-    else:
-      # Step 2: Otherwise continue with normal execution
-      async with aclosing(execute_fn(invocation_context)) as agen:
-        async for event in agen:
-          _apply_run_config_custom_metadata(
-              event, invocation_context.run_config
+        _apply_run_config_custom_metadata(
+            early_exit_event, invocation_context.run_config
+        )
+        if self._should_append_event(early_exit_event, is_live_call):
+          await self.session_service.append_event(
+              session=invocation_context.session,
+              event=early_exit_event,
           )
-          # Step 3: Run the on_event callbacks before persisting so callback
-          # changes are stored in the session and match the streamed event.
-          modified_event = await plugin_manager.run_on_event_callback(
-              invocation_context=invocation_context, event=event
-          )
-          output_event = self._get_output_event(
-              original_event=event,
-              modified_event=modified_event,
-              run_config=invocation_context.run_config,
-          )
+        yield early_exit_event
+      else:
+        # Step 2: Otherwise continue with normal execution
+        async with aclosing(execute_fn(invocation_context)) as agen:
+          async for event in agen:
+            _apply_run_config_custom_metadata(
+                event, invocation_context.run_config
+            )
+            # Step 3: Run the on_event callbacks before persisting so callback
+            # changes are stored in the session and match the streamed event.
+            modified_event = await plugin_manager.run_on_event_callback(
+                invocation_context=invocation_context, event=event
+            )
+            output_event = self._get_output_event(
+                original_event=event,
+                modified_event=modified_event,
+                run_config=invocation_context.run_config,
+            )
 
-          if is_live_call:
-            # Skip partial transcriptions for Live
-            if event.partial is not True and self._should_append_event(
-                event, is_live_call
-            ):
-              logger.debug('Appending live event: %s', output_event)
-              await self.session_service.append_event(
-                  session=invocation_context.session, event=output_event
-              )
-          else:
-            if event.partial is not True:
-              await self.session_service.append_event(
-                  session=invocation_context.session, event=output_event
-              )
+            if is_live_call:
+              # Skip partial transcriptions for Live
+              if event.partial is not True and self._should_append_event(
+                  event, is_live_call
+              ):
+                logger.debug('Appending live event: %s', output_event)
+                await self.session_service.append_event(
+                    session=invocation_context.session, event=output_event
+                )
+            else:
+              if event.partial is not True:
+                await self.session_service.append_event(
+                    session=invocation_context.session, event=output_event
+                )
 
-          yield output_event
+            yield output_event
+    except Exception as e:
+      # Notify plugins of the unhandled execution error. Covers failures in
+      # before_run_callback, early-exit, and the main execution loop.
+      # Notification-only; the original exception is always re-raised.
+      await plugin_manager.run_on_run_error_callback(
+          invocation_context=invocation_context,
+          error=e,
+      )
+      raise
 
     # Step 4: Run the after_run callbacks to perform global cleanup tasks or
     # finalizing logs and metrics data.
-    # This does NOT emit any event.
+    # This does NOT emit any event. Only runs on success.
     await plugin_manager.run_after_run_callback(
         invocation_context=invocation_context
     )
