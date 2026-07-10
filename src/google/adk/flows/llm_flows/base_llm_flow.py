@@ -610,6 +610,26 @@ class BaseLlmFlow(ABC):
             'Establishing live connection for agent: %s',
             invocation_context.agent.name,
         )
+        # Read-only observability hook: let plugins observe the exact
+        # LlmRequest that is about to be sent on the live/CFC path, immediately
+        # before llm.connect(). Runs for every plugin and cannot alter the call
+        # (see PluginManager.run_on_model_request_callback).
+        #
+        # This sits inside the reconnect `while` loop, so it fires once per
+        # connect() attempt: a dropped-and-resumed live session re-fires the
+        # observer for each reconnect. That is intentional — every connect() is
+        # a real send of `llm_request`.
+        #
+        # Unlike the normal path, this request is the fresh object built by
+        # run_live: it is not routed through before_model_callback and is not
+        # given the adk_agent_name label (the documented weaker live/CFC
+        # contract, see on_model_request_callback). The bare CallbackContext
+        # (no event_actions) is deliberate — there is no model_response_event on
+        # this path and a read-only observer must not depend on event_actions.
+        await invocation_context.plugin_manager.run_on_model_request_callback(
+            callback_context=CallbackContext(invocation_context),
+            llm_request=llm_request,
+        )
         async with llm.connect(llm_request) as llm_connection:
           # Reset retry count to allow the maximum reconnect attempts for
           # subsequent connection drops.
@@ -1398,6 +1418,18 @@ class BaseLlmFlow(ABC):
           # call pushes the counter beyond the max set value, then the
           # execution is stopped right here, and exception is thrown.
           invocation_context.increment_llm_call_count()
+
+          # Read-only observability hook: let plugins observe the final
+          # LlmRequest after the call-count guard and immediately before it is
+          # sent. Runs for every plugin and cannot alter the call (see
+          # PluginManager.run_on_model_request_callback).
+          await invocation_context.plugin_manager.run_on_model_request_callback(
+              callback_context=CallbackContext(
+                  invocation_context, event_actions=model_response_event.actions
+              ),
+              llm_request=llm_request,
+          )
+
           responses_generator = llm.generate_content_async(
               llm_request,
               stream=invocation_context.run_config.streaming_mode

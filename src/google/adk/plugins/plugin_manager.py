@@ -49,6 +49,7 @@ PluginCallbackName = Literal[
     "before_tool_callback",
     "after_tool_callback",
     "before_model_callback",
+    "on_model_request_callback",
     "after_model_callback",
     "on_tool_error_callback",
     "on_model_error_callback",
@@ -245,6 +246,22 @@ class PluginManager:
         llm_request=llm_request,
     )
 
+  async def run_on_model_request_callback(
+      self, *, callback_context: CallbackContext, llm_request: LlmRequest
+  ) -> None:
+    """Runs the read-only `on_model_request_callback` for all plugins.
+
+    Unlike the other `run_*` callbacks, this is an observer hook: it never
+    short-circuits, invokes the callback on every registered plugin, and ignores
+    all return values. Plugins use it to observe the final `LlmRequest` right
+    before it is sent to the model.
+    """
+    await self._run_observer_callbacks(
+        "on_model_request_callback",
+        callback_context=callback_context,
+        llm_request=llm_request,
+    )
+
   async def run_after_model_callback(
       self, *, callback_context: CallbackContext, llm_response: LlmResponse
   ) -> Optional[LlmResponse]:
@@ -320,6 +337,39 @@ class PluginManager:
         raise RuntimeError(error_message) from e
 
     return None
+
+  async def _run_observer_callbacks(
+      self, callback_name: PluginCallbackName, **kwargs: Any
+  ) -> None:
+    """Executes a read-only observer callback for all registered plugins.
+
+    Observer callbacks are pure side-effect hooks (e.g. observability) that must
+    not alter control flow. This differs from `_run_callbacks` in two ways:
+
+    - It never short-circuits: every plugin is invoked in registration order and
+      all return values are ignored.
+    - A plugin exception is logged and swallowed rather than re-raised, so a
+      buggy observability plugin cannot abort the operation it is only watching.
+      (An exception is the loudest possible alteration of control flow, which an
+      observer is contractually not allowed to do.)
+
+    Args:
+      callback_name: The name of the observer callback method to execute.
+      **kwargs: Keyword arguments to be passed to the callback method.
+    """
+    for plugin in self.plugins:
+      callback_method = getattr(plugin, callback_name)
+      try:
+        await callback_method(**kwargs)
+      except Exception as e:  # pylint: disable=broad-except
+        logger.error(
+            "Error in plugin '%s' during '%s' observer callback; ignoring so it"
+            " does not affect the operation: %s",
+            plugin.name,
+            callback_name,
+            e,
+            exc_info=True,
+        )
 
   async def close(self) -> None:
     """Calls the close method on all registered plugins concurrently.

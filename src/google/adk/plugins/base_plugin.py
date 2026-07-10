@@ -250,6 +250,54 @@ class BasePlugin(ABC):
     """
     pass
 
+  async def on_model_request_callback(
+      self, *, callback_context: CallbackContext, llm_request: LlmRequest
+  ) -> None:
+    """Observes the `LlmRequest` immediately before it is sent to the model.
+
+    This is the intended place for observability/auditing plugins to snapshot
+    the request that is actually sent. It always receives the **exact**
+    `LlmRequest` object handed to the model, on whichever path issues the call.
+
+    Semantics:
+
+    - It is invoked for **every** registered plugin (there is no early exit), in
+      plugin registration order, and it is always the last request-time hook to
+      run before the model call.
+    - It does **not** fire when an earlier `before_model_callback` short-circuits
+      the call by returning an `LlmResponse` (no request is sent in that case).
+    - Read-only by **convention**, not enforcement: for performance the live
+      `LlmRequest` is passed (no per-call copy). The return value is ignored, so
+      this hook cannot short-circuit the call, but if it mutates `llm_request`
+      the mutation **will** be sent to the model. Do not mutate here — use
+      `before_model_callback` for that.
+    - Exceptions raised here are logged and swallowed; they do not abort the
+      model call (an observer must not alter control flow).
+
+    Finalization differs by path:
+
+    - Normal (`generate_content_async`) path: fires *after* all
+      `before_model_callback`s (both plugin and agent) and after ADK finalizes
+      the request (e.g. the `adk_agent_name` entry in `config.labels`). Here the
+      observed request reflects all callback edits and ADK-injected labels.
+    - Live / CFC (`llm.connect`) path: fires immediately before `llm.connect()`
+      on the fresh `LlmRequest` that `run_live` builds and sends. That request is
+      **not** routed through `before_model_callback` and is **not** given the
+      `adk_agent_name` label, so consumers must not assume that label (or other
+      normal-path finalization) is present on the live path. See the observer
+      contract note in issue #6222.
+
+    Latency: on the normal path this hook runs inside the `call_llm` span, on
+    the request critical path. Heavy synchronous work here (e.g. a blocking
+    write to an analytics store) inflates measured model latency and is
+    attributed to the `call_llm` span — do such work asynchronously/off-path.
+
+    Args:
+      callback_context: The context for the current agent call.
+      llm_request: The request object that will be sent to the model.
+    """
+    pass
+
   async def after_model_callback(
       self, *, callback_context: CallbackContext, llm_response: LlmResponse
   ) -> Optional[LlmResponse]:
